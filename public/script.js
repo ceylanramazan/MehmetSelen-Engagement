@@ -187,14 +187,14 @@ function updateUploadButton() {
     }
 }
 
-// Upload functionality
+// Google Drive Upload functionality
 async function uploadFiles() {
     if (selectedFiles.length === 0 || isUploading) return;
     
     isUploading = true;
     updateUploadButton();
     
-    console.log('Starting upload process...');
+    console.log('Google Drive yükleme işlemi başlıyor...');
     
     // Show progress and hide entire upload section
     if (progressContainer) progressContainer.style.display = 'block';
@@ -204,38 +204,77 @@ async function uploadFiles() {
     const uploaderName = uploaderNameInput?.value?.trim() || 'Anonim';
     const totalFiles = selectedFiles.length;
     let completedFiles = 0;
+    let totalBytes = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+    let uploadedBytes = 0;
     
     try {
-        // For now, simulate upload process since Firebase Storage might not be ready
-        if (progressText) progressText.textContent = `Dosyalar yükleniyor... (0/${totalFiles})`;
-        
-        // Simulate upload progress
-        for (let i = 0; i < totalFiles; i++) {
-            await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay per file
-            completedFiles++;
-            
-            const progress = (completedFiles / totalFiles) * 100;
-            if (progressBar) progressBar.style.width = `${progress}%`;
-            if (progressText) progressText.textContent = `Dosyalar yükleniyor... (${completedFiles}/${totalFiles})`;
+        // Google Drive API hazır mı kontrol et
+        if (!window.googleDriveRefs?.isReady()) {
+            throw new Error('Google Drive API henüz hazır değil. Lütfen birkaç saniye bekleyin.');
         }
         
-        // Show success message
+        // Kullanıcı kimlik doğrulaması
+        const isAuthenticated = await window.googleDriveRefs.authenticate();
+        if (!isAuthenticated) {
+            throw new Error('Google hesabına giriş yapılamadı');
+        }
+        
+        if (progressText) progressText.textContent = `Google Drive'a yükleniyor... (0/${totalFiles})`;
+        
+        // Her dosyayı sırayla yükle
+        for (let i = 0; i < totalFiles; i++) {
+            const file = selectedFiles[i];
+            
+            try {
+                console.log(`Dosya yükleniyor: ${file.name} (${formatFileSize(file.size)})`);
+                
+                // Dosyayı Google Drive'a yükle
+                await uploadSingleFileToGoogleDrive(file, uploaderName, (progress) => {
+                    // Dosya bazında progress callback
+                    const fileProgress = (uploadedBytes + (file.size * progress / 100)) / totalBytes * 100;
+                    if (progressBar) progressBar.style.width = `${fileProgress}%`;
+                    if (progressText) {
+                        progressText.textContent = `${file.name} yükleniyor... ${Math.round(progress)}%`;
+                    }
+                });
+                
+                uploadedBytes += file.size;
+                completedFiles++;
+                
+                // Genel progress güncelle
+                const overallProgress = (completedFiles / totalFiles) * 100;
+                if (progressBar) progressBar.style.width = `${overallProgress}%`;
+                if (progressText) {
+                    progressText.textContent = `Dosyalar yüklendi: ${completedFiles}/${totalFiles}`;
+                }
+                
+                console.log(`Dosya başarıyla yüklendi: ${file.name}`);
+                
+            } catch (fileError) {
+                console.error(`Dosya yükleme hatası (${file.name}):`, fileError);
+                showToast(`${file.name} yüklenemedi: ${fileError.message}`, 'warning');
+                // Diğer dosyalarla devam et
+            }
+        }
+        
+        // Başarı mesajını göster
         if (progressContainer) progressContainer.style.display = 'none';
         if (successMessage) successMessage.style.display = 'block';
         
-        // Reset form
+        // Form'u sıfırla
         selectedFiles = [];
         updateSelectedFilesDisplay();
         if (uploaderNameInput) uploaderNameInput.value = '';
         if (fileInput) fileInput.value = '';
         
-        console.log('Upload completed successfully!');
+        console.log('Tüm dosyalar başarıyla yüklendi!');
+        showToast(`${completedFiles} dosya başarıyla Google Drive'a yüklendi!`, 'success');
         
     } catch (error) {
-        console.error('Upload process error:', error);
-        showToast('Yükleme sırasında hata oluştu', 'error');
+        console.error('Google Drive yükleme hatası:', error);
+        showToast(`Yükleme hatası: ${error.message}`, 'error');
         
-        // Reset UI - show upload section again
+        // UI'yi sıfırla - upload section'ı tekrar göster
         if (progressContainer) progressContainer.style.display = 'none';
         const uploadSection = document.querySelector('.upload-section');
         if (uploadSection) uploadSection.style.display = 'block';
@@ -245,47 +284,86 @@ async function uploadFiles() {
     updateUploadButton();
 }
 
-async function uploadSingleFile(file, uploaderName) {
+// Google Drive'a tek dosya yükleme fonksiyonu
+async function uploadSingleFileToGoogleDrive(file, uploaderName, progressCallback) {
     const fileName = generateFileName(file.name, uploaderName);
-    const fileRef = window.firebaseRefs.uploadsRef.child(fileName);
+    const folderId = window.googleDriveRefs.getFolderId();
+    const gapi = window.googleDriveRefs.gapi();
     
-    // Upload file to Storage
-    const uploadTask = fileRef.put(file);
+    if (!folderId) {
+        throw new Error('Nişan klasörü bulunamadı');
+    }
     
     return new Promise((resolve, reject) => {
-        uploadTask.on(
-            'state_changed',
-            (snapshot) => {
-                // Progress handling is done at the batch level
-            },
-            (error) => {
-                reject(error);
-            },
-            async () => {
-                try {
-                    // Get download URL
-                    const downloadURL = await uploadTask.snapshot.ref.getDownloadURL();
-                    
-                    // Save metadata to Firestore
-                    await window.firebaseRefs.uploadsCollection.add({
-                        fileName: file.name,
-                        storagePath: fileName,
-                        downloadURL: downloadURL,
-                        uploaderName: uploaderName,
-                        fileType: getFileType(file.type),
-                        mimeType: file.type,
-                        fileSize: file.size,
-                        uploadedAt: firebase.firestore.FieldValue.serverTimestamp(),
-                        createdAt: firebase.firestore.Timestamp.now()
-                    });
-                    
-                    resolve(downloadURL);
-                } catch (error) {
-                    reject(error);
+        // Dosya metadata'sı
+        const metadata = {
+            name: fileName,
+            parents: [folderId],
+            description: `${uploaderName} tarafından yüklendi - Selen & Mehmet Nişan Anıları`
+        };
+        
+        // Form data oluştur
+        const form = new FormData();
+        form.append('metadata', new Blob([JSON.stringify(metadata)], {type: 'application/json'}));
+        form.append('file', file);
+        
+        // XMLHttpRequest ile yükleme (progress tracking için)
+        const xhr = new XMLHttpRequest();
+        
+        // Progress event listener
+        xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+                const progress = (e.loaded / e.total) * 100;
+                if (progressCallback) {
+                    progressCallback(progress);
                 }
             }
-        );
+        });
+        
+        // Load event listener
+        xhr.addEventListener('load', () => {
+            if (xhr.status === 200) {
+                try {
+                    const response = JSON.parse(xhr.responseText);
+                    console.log(`Dosya başarıyla yüklendi: ${response.name} (ID: ${response.id})`);
+                    resolve(response);
+                } catch (parseError) {
+                    reject(new Error('Sunucu yanıtı işlenemedi'));
+                }
+            } else {
+                reject(new Error(`Yükleme hatası: ${xhr.status} - ${xhr.statusText}`));
+            }
+        });
+        
+        // Error event listener
+        xhr.addEventListener('error', () => {
+            reject(new Error('Ağ hatası oluştu'));
+        });
+        
+        // Timeout event listener
+        xhr.addEventListener('timeout', () => {
+            reject(new Error('Yükleme zaman aşımına uğradı'));
+        });
+        
+        // Request ayarları
+        xhr.timeout = 300000; // 5 dakika timeout
+        xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart');
+        
+        // Authorization header
+        const authInstance = gapi.auth2.getAuthInstance();
+        const accessToken = authInstance.currentUser.get().getAuthResponse().access_token;
+        xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`);
+        
+        // Yüklemeyi başlat
+        xhr.send(form);
     });
+}
+
+// Eski Firebase fonksiyonu (artık kullanılmıyor)
+async function uploadSingleFile(file, uploaderName) {
+    // Bu fonksiyon artık kullanılmıyor - Google Drive kullanıyoruz
+    console.warn('uploadSingleFile fonksiyonu artık kullanılmıyor. uploadSingleFileToGoogleDrive kullanın.');
+    return null;
 }
 
 // UI Helper functions
@@ -558,9 +636,27 @@ function updateRecordingTimer() {
     }
 }
 
-// Initialize when Firebase is ready
-firebase.auth().onAuthStateChanged((user) => {
-    if (user) {
-        console.log('User authenticated:', user.uid);
-    }
+// Google Drive API hazır olduğunda çalışacak
+document.addEventListener('DOMContentLoaded', () => {
+    // Google Drive API'nin yüklenmesini bekle
+    const checkGoogleDriveReady = setInterval(() => {
+        if (window.googleDriveRefs?.isReady()) {
+            console.log('Google Drive API hazır!');
+            clearInterval(checkGoogleDriveReady);
+            
+            // UI'yi güncelle
+            const uploadBtn = document.getElementById('uploadBtn');
+            if (uploadBtn && uploadBtn.disabled && selectedFiles.length > 0) {
+                updateUploadButton();
+            }
+        }
+    }, 1000);
+    
+    // 30 saniye sonra timeout
+    setTimeout(() => {
+        clearInterval(checkGoogleDriveReady);
+        if (!window.googleDriveRefs?.isReady()) {
+            showToast('Google Drive bağlantısı kurulamadı. Sayfayı yenileyin.', 'error');
+        }
+    }, 30000);
 });
